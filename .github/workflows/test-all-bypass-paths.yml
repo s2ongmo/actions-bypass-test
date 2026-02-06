@@ -319,21 +319,7 @@ jobs:
 
           WF_CONTENT=$(echo -n "name: test4\non: workflow_dispatch\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo t4" | base64 -w 0)
 
-          QUERY=$(cat <<'GRAPHQL'
-          mutation($repo: String!, $branch: String!, $oid: GitObjectID!, $contents: Base64String!) {
-            createCommitOnBranch(input: {
-              branch: { repositoryNameWithOwner: $repo, branchName: $branch }
-              message: { headline: "test4: graphql bypass" }
-              expectedHeadOid: $oid
-              fileChanges: {
-                additions: [{ path: ".github/workflows/bypass-test-4.yml", contents: $contents }]
-              }
-            }) {
-              commit { oid url }
-            }
-          }
-GRAPHQL
-          )
+          QUERY='mutation($repo: String!, $branch: String!, $oid: GitObjectID!, $contents: Base64String!) { createCommitOnBranch(input: { branch: { repositoryNameWithOwner: $repo, branchName: $branch } message: { headline: "test4: graphql bypass" } expectedHeadOid: $oid fileChanges: { additions: [{ path: ".github/workflows/bypass-test-4.yml", contents: $contents }] } }) { commit { oid url } } }'
 
           HTTP=$(curl -s -o /tmp/t4.json -w "%{http_code}" \
             -H "Authorization: bearer $GH_TOKEN" \
