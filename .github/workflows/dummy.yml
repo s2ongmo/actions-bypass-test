@@ -1,0 +1,16 @@
+name: dummy
+on: workflow_dispatch
+jobs:
+  hi:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hello
+```
+
+**3. PoC 워크플로우 추가** (1분)
+
+같은 방식으로 `.github/workflows/test-all-bypass-paths.yml` 생성 — 방금 내가 만든 파일 내용 그대로 복붙.
+
+**4. 실행** (1분)
+```
+repo → Actions 탭 → "Workflow Scope Bypass - All Paths" → Run workflow → Run
