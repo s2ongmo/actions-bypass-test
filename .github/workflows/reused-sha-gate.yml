@@ -1,0 +1,15 @@
+name: reused-sha-gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  gate:
+    name: reused-sha-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delay new head status
+        run: sleep 25
+      - name: Pass
+        run: 'true'
