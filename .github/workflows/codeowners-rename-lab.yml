@@ -1,0 +1,27 @@
+name: CODEOWNERS rename lab
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  rename:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rename protected file and open PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: codeowners-rename-lab-${{ github.run_id }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          mkdir -p modules/lab/1.0.0
+          git mv protected.txt modules/lab/1.0.0/protected.txt
+          git commit -m "Lab: rename protected file into unowned modules path"
+          git push origin "HEAD:$BRANCH"
+          gh pr create --base main --head "$BRANCH" --title "Lab: CODEOWNERS rename destination test" --body "Disposable safe test."
